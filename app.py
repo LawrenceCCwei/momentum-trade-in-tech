@@ -27,6 +27,7 @@ KLINE_TIMEFRAMES = {
     "2Y (1W)": ("2y", "1wk"),
     "5Y (1W)": ("5y", "1wk"),
 }
+DEFAULT_EMA_WINDOWS = [5, 10, 20, 60, 120, 240]
 
 
 def calc_max_drawdown(equity_curve: pd.Series) -> float:
@@ -87,7 +88,9 @@ def fetch_symbol_quote(symbol: str) -> Optional[dict]:
                 change_pct = None
             return {
                 "symbol": symbol,
+                "close": float(last_close),
                 "volume": last_volume,
+                "turnover": (float(last_volume) * float(last_close)) if last_volume is not None else None,
                 "change_percent": change_pct,
             }
         except Exception as exc:
@@ -131,6 +134,88 @@ def fetch_candles(symbol: str, period: str, interval: str) -> pd.DataFrame:
     if last_error:
         return pd.DataFrame()
     return pd.DataFrame()
+
+
+def calc_ma_status(symbol: str, ma_windows: List[int]) -> pd.DataFrame:
+    if not ma_windows:
+        return pd.DataFrame()
+    hist = fetch_candles(symbol, period="3y", interval="1d")
+    if hist.empty or "Close" not in hist.columns:
+        return pd.DataFrame()
+    close = hist["Close"].dropna()
+    if close.empty:
+        return pd.DataFrame()
+
+    latest_close = float(close.iloc[-1])
+    rows: List[dict] = []
+    for win in sorted(set(ma_windows)):
+        if win <= 0:
+            continue
+        ma_series = close.rolling(win).mean().dropna()
+        if ma_series.empty:
+            rows.append(
+                {
+                    "MA": f"MA{win}",
+                    "Close": latest_close,
+                    "MA Value": np.nan,
+                    "Above MA": "N/A",
+                    "Distance %": np.nan,
+                }
+            )
+            continue
+        ma_val = float(ma_series.iloc[-1])
+        dist_pct = ((latest_close - ma_val) / ma_val * 100.0) if ma_val != 0 else np.nan
+        rows.append(
+            {
+                "MA": f"MA{win}",
+                "Close": latest_close,
+                "MA Value": ma_val,
+                "Above MA": "Yes" if latest_close >= ma_val else "No",
+                "Distance %": dist_pct,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def calc_ema_status(symbol: str, ema_windows: List[int]) -> pd.DataFrame:
+    if not ema_windows:
+        return pd.DataFrame()
+    hist = fetch_candles(symbol, period="3y", interval="1d")
+    if hist.empty or "Close" not in hist.columns:
+        return pd.DataFrame()
+    close = hist["Close"].dropna()
+    if close.empty:
+        return pd.DataFrame()
+
+    latest_close = float(close.iloc[-1])
+    rows: List[dict] = []
+    for win in sorted(set(ema_windows)):
+        if win <= 0:
+            continue
+        ema_series = close.ewm(span=win, adjust=False).mean().dropna()
+        if ema_series.empty:
+            rows.append(
+                {
+                    "EMA": f"EMA{win}",
+                    "Close": latest_close,
+                    "EMA Value": np.nan,
+                    "Above EMA": "N/A",
+                    "Distance %": np.nan,
+                }
+            )
+            continue
+        ema_val = float(ema_series.iloc[-1])
+        dist_pct = ((latest_close - ema_val) / ema_val * 100.0) if ema_val != 0 else np.nan
+        rows.append(
+            {
+                "EMA": f"EMA{win}",
+                "Close": latest_close,
+                "EMA Value": ema_val,
+                "Above EMA": "Yes" if latest_close >= ema_val else "No",
+                "Distance %": dist_pct,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def run_momentum_backtest(
@@ -279,6 +364,7 @@ def aggregate_by_sector(
     missing = []
     for sector, symbols in sector_map.items():
         volumes = []
+        turnovers = []
         changes = []
         for symbol in symbols:
             quote = by_symbol.get(symbol)
@@ -286,6 +372,7 @@ def aggregate_by_sector(
                 missing.append(symbol)
                 continue
             volume = pick_float(quote, ["volume", "day_volume", "dayVolume"])
+            turnover = pick_float(quote, ["turnover", "notional", "amount"])
             change_pct = pick_float(
                 quote,
                 [
@@ -298,9 +385,12 @@ def aggregate_by_sector(
             )
             if volume is not None:
                 volumes.append(volume)
+            if turnover is not None:
+                turnovers.append(turnover)
             if change_pct is not None:
                 changes.append((change_pct, volume))
         total_volume = sum(volumes) if volumes else None
+        total_turnover = sum(turnovers) if turnovers else None
         if changes:
             weighted = [c * v for c, v in changes if v is not None]
             if weighted and any(v is not None for _, v in changes):
@@ -314,6 +404,7 @@ def aggregate_by_sector(
             {
                 "sector": sector,
                 "total_volume": total_volume,
+                "total_turnover": total_turnover,
                 "change_pct": change,
                 "symbols": ", ".join(symbols),
             }
@@ -330,6 +421,7 @@ def build_stock_level_df(quotes: List[dict], sector_map: Dict[str, List[str]]) -
             if not quote:
                 continue
             volume = pick_float(quote, ["volume", "day_volume", "dayVolume"])
+            turnover = pick_float(quote, ["turnover", "notional", "amount"])
             change_pct = pick_float(
                 quote,
                 [
@@ -345,6 +437,7 @@ def build_stock_level_df(quotes: List[dict], sector_map: Dict[str, List[str]]) -
                     "sector": sector,
                     "symbol": symbol,
                     "volume": volume if volume is not None and volume > 0 else 1.0,
+                    "turnover": turnover if turnover is not None and turnover > 0 else 1.0,
                     "change_pct": change_pct,
                 }
             )
@@ -360,7 +453,7 @@ def main() -> None:
     st.set_page_config(page_title="US Tech Sector Heatmap", layout="wide")
 
     st.title("US Tech Sector Flow Heatmap")
-    st.caption("Blocks sized by total volume, colored by daily % change.")
+    st.caption("Blocks sized by liquidity (volume or turnover), colored by daily % change.")
 
     sector_path = Path("sectors.json")
     if not sector_path.exists():
@@ -376,6 +469,11 @@ def main() -> None:
             value=DEFAULT_REFRESH_MINUTES,
         )
         st.write("Daily candles from Yahoo Finance via yfinance.")
+        heatmap_size_metric = st.selectbox(
+            "Heatmap size by",
+            ["Total Volume", "Total Turnover"],
+            index=0,
+        )
 
     if st_autorefresh:
         st_autorefresh(interval=int(refresh_minutes * 60 * 1000), key="auto")
@@ -411,7 +509,8 @@ def main() -> None:
         st.warning("No data returned.")
         st.stop()
 
-    size_series = df["total_volume"].fillna(0)
+    size_col = "total_turnover" if heatmap_size_metric == "Total Turnover" else "total_volume"
+    size_series = df[size_col].fillna(0)
     if size_series.sum() == 0:
         df["size"] = 1
     else:
@@ -432,7 +531,7 @@ def main() -> None:
                 labels=df["sector"],
                 parents=[""] * len(df),
                 values=df["size"],
-                customdata=df[["symbols", "total_volume", "change_pct"]].values,
+                customdata=df[["symbols", "total_volume", "total_turnover", "change_pct"]].values,
                 marker=dict(
                     colors=df["change_pct"],
                     colorscale=[[0.0, "#b91c1c"], [0.5, "#f59e0b"], [1.0, "#10b981"]],
@@ -445,7 +544,8 @@ def main() -> None:
                     "Sector: %{label}<br>"
                     "Symbols: %{customdata[0]}<br>"
                     "Total Volume: %{customdata[1]:,.0f}<br>"
-                    "% Change: %{customdata[2]:.2f}<extra></extra>"
+                    "Total Turnover: $%{customdata[2]:,.0f}<br>"
+                    "% Change: %{customdata[3]:.2f}<extra></extra>"
                 ),
             )
         )
@@ -461,6 +561,8 @@ def main() -> None:
                     "value": float(row["size"]) if pd.notna(row["size"]) else 1.0,
                     "change_pct": float(row["change_pct"]) if pd.notna(row["change_pct"]) else 0.0,
                     "is_sector": True,
+                    "volume": float(row["total_volume"]) if pd.notna(row["total_volume"]) else 0.0,
+                    "turnover": float(row["total_turnover"]) if pd.notna(row["total_turnover"]) else 0.0,
                 }
             )
         for _, row in stock_df.iterrows():
@@ -473,6 +575,8 @@ def main() -> None:
                     "change_pct": float(row["change_pct"]) if pd.notna(row["change_pct"]) else 0.0,
                     "is_sector": False,
                     "sector": row["sector"],
+                    "volume": float(row["volume"]) if pd.notna(row["volume"]) else 0.0,
+                    "turnover": float(row["turnover"]) if pd.notna(row["turnover"]) else 0.0,
                 }
             )
 
@@ -485,6 +589,8 @@ def main() -> None:
                     "value": float(df["size"].sum()) if not df["size"].empty else 1.0,
                     "change_pct": 0.0,
                     "is_sector": True,
+                    "volume": float(df["total_volume"].fillna(0).sum()),
+                    "turnover": float(df["total_turnover"].fillna(0).sum()),
                 }
             ]
             + sector_nodes
@@ -494,9 +600,10 @@ def main() -> None:
         customdata = np.column_stack(
             [
                 tree_df["label"],
-                tree_df["change_pct"],
-                tree_df["value"],
                 tree_df.get("sector", tree_df["label"]),
+                tree_df["volume"],
+                tree_df["turnover"],
+                tree_df["change_pct"],
                 tree_df["is_sector"],
             ]
         )
@@ -519,9 +626,10 @@ def main() -> None:
                 textinfo="label+value",
                 hovertemplate=(
                     "Node: %{customdata[0]}<br>"
-                    "Sector: %{customdata[3]}<br>"
+                    "Sector: %{customdata[1]}<br>"
                     "Volume: %{customdata[2]:,.0f}<br>"
-                    "% Change: %{customdata[1]:.2f}<extra></extra>"
+                    "Turnover: $%{customdata[3]:,.0f}<br>"
+                    "% Change: %{customdata[4]:.2f}<extra></extra>"
                 ),
             )
         )
@@ -531,12 +639,13 @@ def main() -> None:
 
     st.subheader("Sector Summary")
     st.dataframe(
-        df[["sector", "symbols", "total_volume", "change_pct"]]
+        df[["sector", "symbols", "total_volume", "total_turnover", "change_pct"]]
         .rename(
             columns={
                 "sector": "Sector",
                 "symbols": "Symbols",
                 "total_volume": "Total Volume",
+                "total_turnover": "Total Turnover ($)",
                 "change_pct": "% Change",
             }
         ),
@@ -556,11 +665,16 @@ def main() -> None:
     if hard_failures:
         st.warning("Fetch retries failed for: " + ", ".join(hard_failures))
 
-    # Volume trend (bar chart)
+    # Liquidity trend (bar chart)
     timestamp = datetime.now().strftime("%H:%M:%S")
-    history = st.session_state.get("volume_history", [])
+    history = st.session_state.get("liquidity_history", [])
     snapshot = [
-        {"time": timestamp, "sector": row["sector"], "total_volume": row["total_volume"] or 0}
+        {
+            "time": timestamp,
+            "sector": row["sector"],
+            "total_volume": row["total_volume"] or 0,
+            "total_turnover": row["total_turnover"] or 0,
+        }
         for _, row in df.iterrows()
     ]
     history.extend(snapshot)
@@ -574,18 +688,20 @@ def main() -> None:
         if counts[sector] <= max_points_per_sector:
             trimmed.append(item)
     history = list(reversed(trimmed))
-    st.session_state["volume_history"] = history
+    st.session_state["liquidity_history"] = history
 
-    st.subheader("Volume Trend (Bar)")
+    st.subheader("Liquidity Trend (Bar)")
+    trend_metric = st.selectbox("Trend metric", ["Total Volume", "Total Turnover"], key="trend_metric")
+    trend_col = "total_turnover" if trend_metric == "Total Turnover" else "total_volume"
     hist_df = pd.DataFrame(history)
     if not hist_df.empty:
         fig_bar = px.bar(
             hist_df,
             x="time",
-            y="total_volume",
+            y=trend_col,
             color="sector",
             barmode="group",
-            labels={"time": "Time", "total_volume": "Total Volume", "sector": "Sector"},
+            labels={"time": "Time", trend_col: trend_metric, "sector": "Sector"},
         )
         fig_bar.update_layout(xaxis_tickangle=-45)
         st.plotly_chart(fig_bar, use_container_width=True)
@@ -682,6 +798,12 @@ def main() -> None:
         timeframe_label = st.selectbox("Time frame", list(KLINE_TIMEFRAMES.keys()), key="kline_timeframe")
 
     period, interval = KLINE_TIMEFRAMES[timeframe_label]
+    ema_windows = st.multiselect(
+        "EMA windows (bars)",
+        options=[5, 10, 20, 60, 120, 240],
+        default=DEFAULT_EMA_WINDOWS,
+        key="ema_windows",
+    )
 
     @st.cache_data(ttl=int(refresh_minutes * 60))
     def get_candles(symbol: str, period_key: str, interval_key: str) -> pd.DataFrame:
@@ -713,6 +835,19 @@ def main() -> None:
             row=1,
             col=1,
         )
+        for win in sorted(set(ema_windows)):
+            ema_line = candle_df["Close"].ewm(span=win, adjust=False).mean()
+            fig_k.add_trace(
+                go.Scatter(
+                    x=candle_df.index,
+                    y=ema_line,
+                    mode="lines",
+                    name=f"EMA{win}",
+                    line=dict(width=1.2),
+                ),
+                row=1,
+                col=1,
+            )
         fig_k.add_trace(
             go.Bar(
                 x=candle_df.index,
@@ -741,12 +876,79 @@ def main() -> None:
                 name=selected_symbol,
             )
         )
+        for win in sorted(set(ema_windows)):
+            ema_line = candle_df["Close"].ewm(span=win, adjust=False).mean()
+            fig_k.add_trace(
+                go.Scatter(
+                    x=candle_df.index,
+                    y=ema_line,
+                    mode="lines",
+                    name=f"EMA{win}",
+                    line=dict(width=1.2),
+                )
+            )
         fig_k.update_layout(
             xaxis_rangeslider_visible=False,
             margin=dict(l=10, r=10, t=30, b=10),
             title=f"{selected_symbol} Candlestick ({timeframe_label})",
         )
     st.plotly_chart(fig_k, use_container_width=True)
+
+    st.subheader("Moving Average Status")
+    ma_windows = st.multiselect(
+        "MA windows (days)",
+        options=[5, 10, 20, 30, 50, 60, 120, 150, 200],
+        default=[20, 60, 120, 200],
+        key="ma_windows",
+    )
+
+    @st.cache_data(ttl=int(refresh_minutes * 60))
+    def get_ma_status(symbol: str, windows: Tuple[int, ...]) -> pd.DataFrame:
+        return calc_ma_status(symbol, list(windows))
+
+    ma_df = get_ma_status(selected_symbol, tuple(sorted(ma_windows)))
+    if ma_df.empty:
+        st.warning(f"No MA status available for {selected_symbol}.")
+    else:
+        above_count = int((ma_df["Above MA"] == "Yes").sum())
+        total_count = int((ma_df["Above MA"].isin(["Yes", "No"])).sum())
+        st.caption(f"{selected_symbol}: above {above_count}/{total_count} selected moving averages")
+        st.dataframe(
+            ma_df.style.format(
+                {
+                    "Close": "{:,.2f}",
+                    "MA Value": "{:,.2f}",
+                    "Distance %": "{:+.2f}%",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.subheader("EMA Status")
+
+    @st.cache_data(ttl=int(refresh_minutes * 60))
+    def get_ema_status(symbol: str, windows: Tuple[int, ...]) -> pd.DataFrame:
+        return calc_ema_status(symbol, list(windows))
+
+    ema_df = get_ema_status(selected_symbol, tuple(sorted(ema_windows)))
+    if ema_df.empty:
+        st.warning(f"No EMA status available for {selected_symbol}.")
+    else:
+        ema_above_count = int((ema_df["Above EMA"] == "Yes").sum())
+        ema_total_count = int((ema_df["Above EMA"].isin(["Yes", "No"])).sum())
+        st.caption(f"{selected_symbol}: above {ema_above_count}/{ema_total_count} selected EMAs")
+        st.dataframe(
+            ema_df.style.format(
+                {
+                    "Close": "{:,.2f}",
+                    "EMA Value": "{:,.2f}",
+                    "Distance %": "{:+.2f}%",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 if __name__ == "__main__":
