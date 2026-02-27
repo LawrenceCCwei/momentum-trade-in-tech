@@ -321,6 +321,36 @@ def aggregate_by_sector(
     return pd.DataFrame(rows), missing
 
 
+def build_stock_level_df(quotes: List[dict], sector_map: Dict[str, List[str]]) -> pd.DataFrame:
+    by_symbol = {pick_str(q, ["symbol", "ticker", "code"]): q for q in quotes}
+    rows: List[dict] = []
+    for sector, symbols in sector_map.items():
+        for symbol in symbols:
+            quote = by_symbol.get(symbol)
+            if not quote:
+                continue
+            volume = pick_float(quote, ["volume", "day_volume", "dayVolume"])
+            change_pct = pick_float(
+                quote,
+                [
+                    "change_percent",
+                    "changePercent",
+                    "percent_change",
+                    "change_pct",
+                    "day_change_percent",
+                ],
+            )
+            rows.append(
+                {
+                    "sector": sector,
+                    "symbol": symbol,
+                    "volume": volume if volume is not None and volume > 0 else 1.0,
+                    "change_pct": change_pct,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def load_sector_map(path: Path) -> Dict[str, List[str]]:
     with path.open("r", encoding="ascii") as handle:
         return json.load(handle)
@@ -394,29 +424,108 @@ def main() -> None:
         max_abs = max(abs(valid_changes.min()), abs(valid_changes.max()))
         range_color = (-max_abs, max_abs)
 
+    stock_df = build_stock_level_df(quotes, sector_map)
     min_c, max_c = range_color
-    fig = go.Figure(
-        go.Treemap(
-            labels=df["sector"],
-            parents=[""] * len(df),
-            values=df["size"],
-            customdata=df[["symbols", "total_volume", "change_pct"]].values,
-            marker=dict(
-                colors=df["change_pct"],
-                colorscale=[[0.0, "#b91c1c"], [0.5, "#f59e0b"], [1.0, "#10b981"]],
-                cmin=min_c,
-                cmax=max_c,
-                colorbar=dict(title="% Change"),
-            ),
-            textinfo="label+value",
-            hovertemplate=(
-                "Sector: %{label}<br>"
-                "Symbols: %{customdata[0]}<br>"
-                "Total Volume: %{customdata[1]:,.0f}<br>"
-                "% Change: %{customdata[2]:.2f}<extra></extra>"
-            ),
+    if stock_df.empty:
+        fig = go.Figure(
+            go.Treemap(
+                labels=df["sector"],
+                parents=[""] * len(df),
+                values=df["size"],
+                customdata=df[["symbols", "total_volume", "change_pct"]].values,
+                marker=dict(
+                    colors=df["change_pct"],
+                    colorscale=[[0.0, "#b91c1c"], [0.5, "#f59e0b"], [1.0, "#10b981"]],
+                    cmin=min_c,
+                    cmax=max_c,
+                    colorbar=dict(title="% Change"),
+                ),
+                textinfo="label+value",
+                hovertemplate=(
+                    "Sector: %{label}<br>"
+                    "Symbols: %{customdata[0]}<br>"
+                    "Total Volume: %{customdata[1]:,.0f}<br>"
+                    "% Change: %{customdata[2]:.2f}<extra></extra>"
+                ),
+            )
         )
-    )
+    else:
+        sector_nodes = []
+        symbol_nodes = []
+        for _, row in df.iterrows():
+            sector_nodes.append(
+                {
+                    "id": f"sector::{row['sector']}",
+                    "label": row["sector"],
+                    "parent": "root",
+                    "value": float(row["size"]) if pd.notna(row["size"]) else 1.0,
+                    "change_pct": float(row["change_pct"]) if pd.notna(row["change_pct"]) else 0.0,
+                    "is_sector": True,
+                }
+            )
+        for _, row in stock_df.iterrows():
+            symbol_nodes.append(
+                {
+                    "id": f"symbol::{row['sector']}::{row['symbol']}",
+                    "label": row["symbol"],
+                    "parent": f"sector::{row['sector']}",
+                    "value": float(row["volume"]) if pd.notna(row["volume"]) else 1.0,
+                    "change_pct": float(row["change_pct"]) if pd.notna(row["change_pct"]) else 0.0,
+                    "is_sector": False,
+                    "sector": row["sector"],
+                }
+            )
+
+        tree_nodes = (
+            [
+                {
+                    "id": "root",
+                    "label": "All Sectors",
+                    "parent": "",
+                    "value": float(df["size"].sum()) if not df["size"].empty else 1.0,
+                    "change_pct": 0.0,
+                    "is_sector": True,
+                }
+            ]
+            + sector_nodes
+            + symbol_nodes
+        )
+        tree_df = pd.DataFrame(tree_nodes)
+        customdata = np.column_stack(
+            [
+                tree_df["label"],
+                tree_df["change_pct"],
+                tree_df["value"],
+                tree_df.get("sector", tree_df["label"]),
+                tree_df["is_sector"],
+            ]
+        )
+
+        fig = go.Figure(
+            go.Treemap(
+                ids=tree_df["id"],
+                labels=tree_df["label"],
+                parents=tree_df["parent"],
+                values=tree_df["value"],
+                customdata=customdata,
+                branchvalues="total",
+                marker=dict(
+                    colors=tree_df["change_pct"],
+                    colorscale=[[0.0, "#b91c1c"], [0.5, "#f59e0b"], [1.0, "#10b981"]],
+                    cmin=min_c,
+                    cmax=max_c,
+                    colorbar=dict(title="% Change"),
+                ),
+                textinfo="label+value",
+                hovertemplate=(
+                    "Node: %{customdata[0]}<br>"
+                    "Sector: %{customdata[3]}<br>"
+                    "Volume: %{customdata[2]:,.0f}<br>"
+                    "% Change: %{customdata[1]:.2f}<extra></extra>"
+                ),
+            )
+        )
+        fig.update_layout(title="Click a sector block to drill down into symbols")
 
     st.plotly_chart(fig, use_container_width=True)
 
