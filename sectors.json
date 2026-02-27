@@ -1,0 +1,22 @@
+{
+  "EDA & IP": ["SNPS", "CDNS", "ANSS", "ARM"],
+  "Semicap Equipment": ["ASML", "AMAT", "LRCX", "KLAC", "TER"],
+  "Advanced Foundry": ["TSM", "GFS", "UMC"],
+  "AI Accelerators & CPUs": ["NVDA", "AMD", "INTC"],
+  "Custom Silicon / ASICs": ["AVGO", "MRVL", "MCHP"],
+  "Memory & Storage": ["MU", "WDC", "STX"],
+  "Physical Fiber & Connectors": ["GLW", "APH"],
+  "Optical Components & Transceivers": ["COHR", "LITE", "AAOI", "POET"],
+  "Optical Manufacturing & Packaging": ["FN"],
+  "High-Speed Connectivity ICs": ["ALAB", "CRDO"],
+  "Networking Systems & Telecom": ["ANET", "CSCO", "CIEN", "LUMN"],
+  "AI Servers & Systems": ["SMCI", "DELL", "HPE"],
+  "Thermal & Datacenter Power": ["VRT", "MOD", "JCI", "ETN"],
+  "Power Generation & Utilities": ["CEG", "VST"],
+  "Data Center REITs": ["EQIX", "DLR", "AMT", "CCI"],
+  "Cloud Hyperscalers": ["MSFT", "AMZN", "GOOGL", "META"],
+  "Enterprise AI & Data": ["PLTR", "NOW", "CRM", "ORCL", "SNOW", "MDB"],
+  "Analog & Power Semis": ["ADI", "TXN", "NXPI", "MPWR"],
+  "Cybersecurity & Edge Network": ["CRWD", "PANW", "FTNT", "ZS", "NET"],
+  "Edge AI & Devices": ["AAPL", "QCOM", "TSLA"]
+}
