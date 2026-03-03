@@ -1,0 +1,9 @@
+sector_a,sector_b,correlation
+IC Design (ASIC/Custom),Analog & Power Semis,0.8544444669696214
+Semicap Equipment,Analog & Power Semis,0.8408800364023584
+IC Design (ASIC/Custom),Semicap Equipment,0.8289248859601469
+IC Design (ASIC/Custom),GPU/CPU & Compute,0.8027056666435612
+GPU/CPU & Compute,Semicap Equipment,0.800660043115016
+EDA & Design Software,Semicap Equipment,0.7927631809545297
+EDA & Design Software,Analog & Power Semis,0.7853643288458861
+GPU/CPU & Compute,EDA & Design Software,0.7839842668206456

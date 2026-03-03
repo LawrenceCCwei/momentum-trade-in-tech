@@ -1,12 +1,10 @@
 import json
-import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import requests
 import streamlit as st
 import yfinance as yf
 
@@ -17,13 +15,13 @@ def load_sector_map(path: Path) -> Dict[str, List[str]]:
 
 
 @st.cache_data(ttl=3600)
-def fetch_close_data(symbols: Tuple[str, ...], period: str) -> pd.DataFrame:
+def fetch_close_data(symbols: Tuple[str, ...], period: str, interval: str = "1d") -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
     data = yf.download(
         tickers=list(symbols),
         period=period,
-        interval="1d",
+        interval=interval,
         auto_adjust=False,
         progress=False,
         group_by="ticker",
@@ -52,6 +50,166 @@ def ma_filter(close_df: pd.DataFrame, ma_window: int) -> pd.Series:
     ma = close_df.rolling(ma_window).mean().iloc[-1]
     last_close = close_df.iloc[-1]
     return (last_close >= ma).fillna(False)
+
+
+def calc_max_drawdown(equity_curve: pd.Series) -> float:
+    if equity_curve.empty:
+        return 0.0
+    running_max = equity_curve.cummax()
+    drawdown = equity_curve / running_max - 1.0
+    return float(drawdown.min())
+
+
+def calc_sharpe(daily_returns: pd.Series) -> float:
+    if daily_returns.empty:
+        return 0.0
+    vol = daily_returns.std(ddof=0)
+    if vol == 0 or np.isnan(vol):
+        return 0.0
+    return float((daily_returns.mean() / vol) * np.sqrt(252))
+
+
+def calc_sortino(daily_returns: pd.Series) -> float:
+    if daily_returns.empty:
+        return 0.0
+    downside = daily_returns[daily_returns < 0]
+    downside_vol = downside.std(ddof=0) if not downside.empty else 0.0
+    if downside_vol == 0 or np.isnan(downside_vol):
+        return 0.0
+    return float((daily_returns.mean() / downside_vol) * np.sqrt(252))
+
+
+def run_backtest_no_cost(
+    close_df: pd.DataFrame,
+    sector_map: Dict[str, List[str]],
+    lookback: int,
+    ma_window: int,
+    rebalance_days: int,
+    top_k: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if close_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    ret_df = close_df.pct_change()
+    sector_returns = pd.DataFrame(index=ret_df.index)
+    sector_members: Dict[str, List[str]] = {}
+    for sector, symbols in sector_map.items():
+        members = [s for s in symbols if s in ret_df.columns]
+        if not members:
+            continue
+        sector_members[sector] = members
+        sector_returns[sector] = ret_df[members].mean(axis=1, skipna=True)
+
+    sector_returns = sector_returns.dropna(how="all")
+    if sector_returns.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    dates = list(sector_returns.index)
+    min_start = max(int(lookback), int(ma_window))
+    if len(dates) <= min_start + 1:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    strategy_returns = pd.Series(0.0, index=sector_returns.index)
+    rebalance_log: List[dict] = []
+
+    i = min_start
+    while i < len(dates) - 1:
+        d = dates[i]
+        rows = []
+        for sector, members in sector_members.items():
+            close_now = close_df.loc[d, members].dropna()
+            if close_now.empty:
+                continue
+            prev_idx = i - int(lookback)
+            prev_d = dates[prev_idx]
+            close_prev = close_df.loc[prev_d, members].dropna()
+            common = sorted(set(close_now.index).intersection(set(close_prev.index)))
+            if not common:
+                continue
+            mom_vals = close_now[common] / close_prev[common] - 1.0
+            if mom_vals.empty:
+                continue
+
+            hist_slice = close_df.loc[:d, common]
+            ma_vals = hist_slice.rolling(int(ma_window)).mean().iloc[-1].dropna()
+            common2 = sorted(set(common).intersection(set(ma_vals.index)))
+            if not common2:
+                continue
+            above_ratio = float((close_now[common2] >= ma_vals[common2]).mean())
+            sector_mom = float(mom_vals[common2].mean())
+            score = sector_mom * 0.7 + above_ratio * 0.3
+            rows.append(
+                {
+                    "sector": sector,
+                    "score": score,
+                    "sector_momentum": sector_mom,
+                    "above_ma_ratio": above_ratio,
+                }
+            )
+
+        score_df = pd.DataFrame(rows).sort_values("score", ascending=False)
+        if score_df.empty:
+            i += int(rebalance_days)
+            continue
+        selected = score_df.head(int(top_k))
+        selected_sectors = selected["sector"].tolist()
+        rebalance_log.append(
+            {
+                "rebalance_date": pd.to_datetime(d).strftime("%Y-%m-%d"),
+                "selected_sectors": ", ".join(selected_sectors),
+                "avg_score": float(selected["score"].mean()),
+            }
+        )
+
+        end_i = min(i + int(rebalance_days), len(dates) - 1)
+        for j in range(i + 1, end_i + 1):
+            day = dates[j]
+            if selected_sectors:
+                day_ret = sector_returns.loc[day, selected_sectors].mean(skipna=True)
+                strategy_returns.loc[day] = 0.0 if np.isnan(day_ret) else float(day_ret)
+            else:
+                strategy_returns.loc[day] = 0.0
+        i += int(rebalance_days)
+
+    strategy_returns = strategy_returns.loc[strategy_returns.index >= dates[min_start]]
+    benchmark_returns = sector_returns.mean(axis=1, skipna=True).reindex(strategy_returns.index).fillna(0.0)
+    strategy_equity = (1.0 + strategy_returns.fillna(0.0)).cumprod()
+    benchmark_equity = (1.0 + benchmark_returns).cumprod()
+    if strategy_equity.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    span_days = max((strategy_equity.index[-1] - strategy_equity.index[0]).days, 1)
+    years = span_days / 365.25
+    total_return = float(strategy_equity.iloc[-1] - 1.0)
+    cagr = float(strategy_equity.iloc[-1] ** (1.0 / years) - 1.0) if years > 0 else 0.0
+
+    metrics_df = pd.DataFrame(
+        [
+            {"metric": "Total Return", "value": total_return},
+            {"metric": "CAGR", "value": cagr},
+            {"metric": "Sharpe", "value": calc_sharpe(strategy_returns)},
+            {"metric": "Sortino", "value": calc_sortino(strategy_returns)},
+            {"metric": "Max Drawdown", "value": calc_max_drawdown(strategy_equity)},
+            {"metric": "Backtest Start", "value": strategy_equity.index[0].strftime("%Y-%m-%d")},
+            {"metric": "Backtest End", "value": strategy_equity.index[-1].strftime("%Y-%m-%d")},
+        ]
+    )
+
+    curve_df = pd.DataFrame(
+        {
+            "date": strategy_equity.index,
+            "strategy_equity": strategy_equity.values,
+            "benchmark_equity": benchmark_equity.values,
+            "strategy_return": strategy_returns.values,
+            "benchmark_return": benchmark_returns.values,
+        }
+    )
+    curve_df["drawdown"] = curve_df["strategy_equity"] / curve_df["strategy_equity"].cummax() - 1.0
+
+    log_df = pd.DataFrame(rebalance_log)
+    if not log_df.empty:
+        log_df = log_df.sort_values("rebalance_date", ascending=False)
+    return metrics_df, curve_df, log_df
 
 
 def build_sector_scores(
@@ -132,76 +290,6 @@ def build_trade_plan(
     return pd.DataFrame(rows).sort_values("momentum", ascending=False).reset_index(drop=True)
 
 
-def alpaca_headers(api_key: str, secret_key: str) -> Dict[str, str]:
-    return {
-        "APCA-API-KEY-ID": api_key,
-        "APCA-API-SECRET-KEY": secret_key,
-        "Content-Type": "application/json",
-    }
-
-
-def get_alpaca_account(base_url: str, api_key: str, secret_key: str) -> dict:
-    response = requests.get(
-        f"{base_url.rstrip('/')}/v2/account",
-        headers=alpaca_headers(api_key, secret_key),
-        timeout=20,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-def submit_alpaca_market_orders(
-    base_url: str,
-    api_key: str,
-    secret_key: str,
-    trade_plan: pd.DataFrame,
-) -> List[dict]:
-    results: List[dict] = []
-    for _, row in trade_plan.iterrows():
-        symbol = str(row["symbol"])
-        qty = int(row["shares"])
-        if qty <= 0:
-            results.append({"symbol": symbol, "status": "skipped", "reason": "shares <= 0"})
-            continue
-        payload = {
-            "symbol": symbol,
-            "qty": str(qty),
-            "side": "buy",
-            "type": "market",
-            "time_in_force": "day",
-        }
-        try:
-            response = requests.post(
-                f"{base_url.rstrip('/')}/v2/orders",
-                headers=alpaca_headers(api_key, secret_key),
-                json=payload,
-                timeout=20,
-            )
-            if response.status_code >= 400:
-                results.append(
-                    {
-                        "symbol": symbol,
-                        "status": "error",
-                        "http_status": response.status_code,
-                        "response": response.text[:300],
-                    }
-                )
-                continue
-            order = response.json()
-            results.append(
-                {
-                    "symbol": symbol,
-                    "status": "submitted",
-                    "order_id": order.get("id"),
-                    "filled_avg_price": order.get("filled_avg_price"),
-                    "order_status": order.get("status"),
-                }
-            )
-        except requests.RequestException as exc:
-            results.append({"symbol": symbol, "status": "error", "response": str(exc)})
-    return results
-
-
 def main() -> None:
     st.set_page_config(page_title="Tech Momentum Trading", layout="wide")
     st.title("Tech Momentum Trading Planner")
@@ -223,23 +311,8 @@ def main() -> None:
         top_sector_n = st.number_input("Top sectors", min_value=1, max_value=min(10, len(sector_map)), value=4, step=1)
         max_positions = st.number_input("Max positions", min_value=1, max_value=20, value=4, step=1)
         capital = st.number_input("Capital (USD)", min_value=1000.0, max_value=10000000.0, value=100000.0, step=1000.0)
-        st.divider()
-        st.header("Execution")
-        execution_mode = st.selectbox(
-            "Execution mode",
-            ["local_paper", "alpaca_paper"],
-            index=0,
-            help="local_paper: simulate only, alpaca_paper: submit real paper orders to Alpaca account",
-        )
-        default_api_key = os.getenv("APCA_API_KEY_ID", "")
-        default_secret = os.getenv("APCA_API_SECRET_KEY", "")
-        default_base = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-        alpaca_api_key = st.text_input("Alpaca API Key", value=default_api_key, type="password")
-        alpaca_secret_key = st.text_input("Alpaca Secret Key", value=default_secret, type="password")
-        alpaca_base_url = st.text_input("Alpaca Base URL", value=default_base)
-        dry_run = st.checkbox("Dry run only (do not send orders)", value=True)
 
-    close_df = fetch_close_data(tuple(symbols), period)
+    close_df = fetch_close_data(tuple(symbols), period, "1d")
     if close_df.empty:
         st.warning("No price data. Try again later.")
         return
@@ -281,6 +354,68 @@ def main() -> None:
     fig.update_layout(xaxis_tickangle=-30, showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
 
+    st.subheader("Backtest (No Trading Cost)")
+    bt_col1, bt_col2, bt_col3, bt_col4 = st.columns([1, 1, 1, 1])
+    with bt_col1:
+        bt_frequency = st.selectbox("Backtest frequency", ["Daily", "Weekly"], index=0)
+    with bt_col2:
+        bt_rebalance = st.number_input("Rebalance every (bars)", min_value=1, max_value=63, value=5, step=1)
+    with bt_col3:
+        bt_topk = st.number_input(
+            "Backtest Top sectors",
+            min_value=1,
+            max_value=min(10, len(sector_map)),
+            value=min(int(top_sector_n), min(10, len(sector_map))),
+            step=1,
+        )
+    with bt_col4:
+        st.caption("Trading cost is fixed at 0 for this version.")
+
+    bt_interval = "1wk" if bt_frequency == "Weekly" else "1d"
+    bt_close_df = fetch_close_data(tuple(symbols), period, bt_interval)
+
+    metrics_df, curve_df, rebalance_df = run_backtest_no_cost(
+        close_df=bt_close_df,
+        sector_map=sector_map,
+        lookback=int(lookback),
+        ma_window=int(ma_window),
+        rebalance_days=int(bt_rebalance),
+        top_k=int(bt_topk),
+    )
+
+    if metrics_df.empty or curve_df.empty:
+        st.warning("Backtest data not sufficient. Increase history period or reduce windows.")
+    else:
+        metric_map = {r["metric"]: r["value"] for _, r in metrics_df.iterrows()}
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Return", f"{metric_map.get('Total Return', 0.0):.2%}")
+        m2.metric("CAGR", f"{metric_map.get('CAGR', 0.0):.2%}")
+        m3.metric("Sharpe", f"{metric_map.get('Sharpe', 0.0):.2f}")
+        m4.metric("Sortino", f"{metric_map.get('Sortino', 0.0):.2f}")
+        m5.metric("Max Drawdown", f"{metric_map.get('Max Drawdown', 0.0):.2%}")
+
+        eq_fig = px.line(
+            curve_df,
+            x="date",
+            y=["strategy_equity", "benchmark_equity"],
+            title="Equity Curve: Strategy vs Benchmark",
+        )
+        eq_fig.update_layout(legend_title_text="", xaxis_title="Date", yaxis_title="Equity (Start=1)")
+        st.plotly_chart(eq_fig, use_container_width=True)
+
+        dd_fig = px.area(
+            curve_df,
+            x="date",
+            y="drawdown",
+            title="Strategy Drawdown",
+        )
+        dd_fig.update_layout(xaxis_title="Date", yaxis_title="Drawdown")
+        st.plotly_chart(dd_fig, use_container_width=True)
+
+        if not rebalance_df.empty:
+            st.caption("Recent rebalances:")
+            st.dataframe(rebalance_df.head(30), use_container_width=True, hide_index=True)
+
     trade_plan = build_trade_plan(
         top_sectors=top_sectors,
         sector_map=sector_map,
@@ -309,37 +444,6 @@ def main() -> None:
         )
         total_used = float(trade_plan["capital_used"].sum())
         st.caption(f"Capital used: ${total_used:,.2f} / ${capital:,.2f}")
-
-    st.subheader("Execution Console")
-    if execution_mode == "local_paper":
-        st.info("Execution mode is local_paper. No broker API calls will be sent.")
-    else:
-        if not alpaca_api_key or not alpaca_secret_key:
-            st.warning("Enter Alpaca API credentials to use alpaca_paper mode.")
-            return
-        try:
-            account = get_alpaca_account(alpaca_base_url, alpaca_api_key, alpaca_secret_key)
-            st.caption(
-                "Alpaca account status: "
-                f"{account.get('status')} | buying_power={account.get('buying_power')} | cash={account.get('cash')}"
-            )
-        except requests.RequestException as exc:
-            st.error(f"Failed to connect Alpaca account: {exc}")
-            return
-
-        submit = st.button("Submit Buy Orders to Alpaca Paper", disabled=trade_plan.empty)
-        if submit:
-            if dry_run:
-                st.info("Dry run enabled. Orders were not sent.")
-                st.dataframe(trade_plan[["symbol", "shares", "last_price", "capital_used"]], use_container_width=True)
-            else:
-                results = submit_alpaca_market_orders(
-                    alpaca_base_url,
-                    alpaca_api_key,
-                    alpaca_secret_key,
-                    trade_plan,
-                )
-                st.dataframe(pd.DataFrame(results), use_container_width=True)
 
 
 if __name__ == "__main__":

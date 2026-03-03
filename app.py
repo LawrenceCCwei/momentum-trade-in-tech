@@ -9,6 +9,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import trading_app as trading_strategy
 import yfinance as yf
 from plotly.subplots import make_subplots
 
@@ -43,6 +44,16 @@ def calc_sharpe(daily_returns: pd.Series) -> float:
     if vol == 0 or np.isnan(vol):
         return 0.0
     return float((daily_returns.mean() / vol) * np.sqrt(252))
+
+
+def calc_sortino(daily_returns: pd.Series) -> float:
+    if daily_returns.empty:
+        return 0.0
+    downside = daily_returns[daily_returns < 0]
+    downside_vol = downside.std(ddof=0) if not downside.empty else 0.0
+    if downside_vol == 0 or np.isnan(downside_vol):
+        return 0.0
+    return float((daily_returns.mean() / downside_vol) * np.sqrt(252))
 
 
 def pick_float(payload: dict, keys: List[str]) -> Optional[float]:
@@ -311,6 +322,7 @@ def run_momentum_backtest(
             {"metric": "Total Return", "value": total_return},
             {"metric": "CAGR", "value": cagr},
             {"metric": "Sharpe", "value": calc_sharpe(strategy_returns)},
+            {"metric": "Sortino", "value": calc_sortino(strategy_returns)},
             {"metric": "Max Drawdown", "value": calc_max_drawdown(strategy_equity)},
             {"metric": "Backtest Start", "value": strategy_equity.index[0].strftime("%Y-%m-%d")},
             {"metric": "Backtest End", "value": strategy_equity.index[-1].strftime("%Y-%m-%d")},
@@ -330,6 +342,121 @@ def run_momentum_backtest(
     if not picks_df.empty:
         picks_df = picks_df.sort_values("rebalance_date", ascending=False)
     return metrics_df, curve_df, picks_df
+
+
+@st.cache_data(ttl=3600)
+def fetch_close_matrix(symbols: Tuple[str, ...], period: str, interval: str) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    data = yf.download(
+        tickers=list(symbols),
+        period=period,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        group_by="ticker",
+        threads=True,
+    )
+    if data.empty:
+        return pd.DataFrame()
+    if isinstance(data.columns, pd.MultiIndex):
+        close_df = data.xs("Close", axis=1, level=1, drop_level=False)
+        close_df.columns = [c[0] for c in close_df.columns]
+    else:
+        close_df = pd.DataFrame({"SINGLE": data["Close"]})
+    return close_df.sort_index().dropna(how="all")
+
+
+def calc_symbol_momentum(close_df: pd.DataFrame, lookback: int) -> pd.Series:
+    if close_df.empty or len(close_df) <= lookback:
+        return pd.Series(dtype=float)
+    return close_df.iloc[-1] / close_df.iloc[-lookback - 1] - 1.0
+
+
+def calc_symbol_above_ma(close_df: pd.DataFrame, ma_window: int) -> pd.Series:
+    if close_df.empty:
+        return pd.Series(dtype=bool)
+    ma = close_df.rolling(ma_window).mean().iloc[-1]
+    latest = close_df.iloc[-1]
+    return (latest >= ma).fillna(False)
+
+
+def build_sector_rank_df(
+    sector_map: Dict[str, List[str]],
+    symbol_momentum: pd.Series,
+    symbol_above_ma: pd.Series,
+) -> pd.DataFrame:
+    rows: List[dict] = []
+    for sector, members in sector_map.items():
+        valid = [s for s in members if s in symbol_momentum.index]
+        if not valid:
+            continue
+        moms = symbol_momentum[valid].dropna()
+        if moms.empty:
+            continue
+        above_ratio = float(symbol_above_ma.reindex(valid).fillna(False).mean())
+        score = float(moms.mean() * 0.7 + above_ratio * 0.3)
+        rows.append(
+            {
+                "sector": sector,
+                "sector_momentum": float(moms.mean()),
+                "above_ma_ratio": above_ratio,
+                "score": score,
+                "symbols": ", ".join(valid),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+
+
+def build_local_paper_orders(
+    top_sectors: List[str],
+    sector_map: Dict[str, List[str]],
+    close_df: pd.DataFrame,
+    symbol_momentum: pd.Series,
+    symbol_above_ma: pd.Series,
+    capital: float,
+    max_positions: int,
+) -> pd.DataFrame:
+    picks = []
+    for sector in top_sectors:
+        members = sector_map.get(sector, [])
+        ranked = []
+        for symbol in members:
+            if symbol not in close_df.columns:
+                continue
+            s = close_df[symbol].dropna()
+            if s.empty:
+                continue
+            mom = symbol_momentum.get(symbol, np.nan)
+            above = bool(symbol_above_ma.get(symbol, False))
+            last_price = float(s.iloc[-1])
+            if pd.notna(mom) and above:
+                ranked.append((symbol, float(mom), last_price, sector))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        if ranked:
+            picks.append(ranked[0])
+    picks = picks[:max_positions]
+    if not picks:
+        return pd.DataFrame()
+    weight = 1.0 / len(picks)
+    rows = []
+    for symbol, mom, price, sector in picks:
+        budget = capital * weight
+        shares = int(budget // price) if price > 0 else 0
+        rows.append(
+            {
+                "sector": sector,
+                "symbol": symbol,
+                "momentum": mom,
+                "last_price": price,
+                "target_weight": weight,
+                "shares": shares,
+                "capital_used": shares * price,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("momentum", ascending=False).reset_index(drop=True)
 
 
 def merge_with_last_success(
@@ -750,11 +877,12 @@ def main() -> None:
         st.warning("Backtest could not run with current data coverage.")
     else:
         metric_map = {row["metric"]: row["value"] for _, row in metrics_df.iterrows()}
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Total Return", f"{metric_map.get('Total Return', 0.0):.2%}")
         m2.metric("CAGR", f"{metric_map.get('CAGR', 0.0):.2%}")
         m3.metric("Sharpe", f"{metric_map.get('Sharpe', 0.0):.2f}")
-        m4.metric("Max Drawdown", f"{metric_map.get('Max Drawdown', 0.0):.2%}")
+        m4.metric("Sortino", f"{metric_map.get('Sortino', 0.0):.2f}")
+        m5.metric("Max Drawdown", f"{metric_map.get('Max Drawdown', 0.0):.2%}")
 
         fig_bt = go.Figure()
         fig_bt.add_trace(
@@ -786,6 +914,96 @@ def main() -> None:
         if not picks_df.empty:
             st.caption("Recent rebalances (latest 20):")
             st.dataframe(picks_df, use_container_width=True)
+
+    st.subheader("Strategy Lab (Local Paper)")
+    sl_col1, sl_col2, sl_col3, sl_col4, sl_col5 = st.columns([1, 1, 1, 1, 1])
+    with sl_col1:
+        sl_period = st.selectbox("History period", ["1y", "2y", "3y", "5y"], index=1, key="sl_period")
+    with sl_col2:
+        sl_lookback = st.number_input("Momentum lookback (bars)", min_value=5, max_value=252, value=60, step=1)
+    with sl_col3:
+        sl_ma = st.number_input("MA filter (bars)", min_value=5, max_value=252, value=60, step=1)
+    with sl_col4:
+        sl_top_sector = st.number_input(
+            "Top sectors",
+            min_value=1,
+            max_value=max(len(sector_map), 1),
+            value=min(4, max(len(sector_map), 1)),
+            step=1,
+        )
+    with sl_col5:
+        sl_capital = st.number_input(
+            "Capital (USD)",
+            min_value=1000.0,
+            max_value=10000000.0,
+            value=100000.0,
+            step=1000.0,
+        )
+
+    sl_close_df = trading_strategy.fetch_close_data(tuple(symbols), sl_period, "1d")
+    if sl_close_df.empty:
+        st.warning("Strategy lab has no price data.")
+    else:
+        sl_mom = trading_strategy.momentum_series(sl_close_df, int(sl_lookback))
+        sl_above_ma = trading_strategy.ma_filter(sl_close_df, int(sl_ma))
+        sl_sector_rank = trading_strategy.build_sector_scores(sector_map, sl_mom, sl_above_ma)
+
+        if sl_sector_rank.empty:
+            st.warning("No sector ranking available for current strategy params.")
+        else:
+            st.dataframe(
+                sl_sector_rank.style.format(
+                    {
+                        "sector_momentum": "{:+.2%}",
+                        "above_ma_ratio": "{:.0%}",
+                        "score": "{:+.3f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            sl_selected = sl_sector_rank.head(int(sl_top_sector))["sector"].tolist()
+            st.caption("Selected sectors: " + ", ".join(sl_selected))
+            sl_fig = px.bar(
+                sl_sector_rank.head(int(sl_top_sector)),
+                x="sector",
+                y="score",
+                color="sector_momentum",
+                color_continuous_scale=["#b91c1c", "#f59e0b", "#10b981"],
+                title="Top Sector Momentum Score",
+            )
+            sl_fig.update_layout(xaxis_tickangle=-30, showlegend=False)
+            st.plotly_chart(sl_fig, use_container_width=True)
+
+            sl_orders = trading_strategy.build_trade_plan(
+                top_sectors=sl_selected,
+                sector_map=sector_map,
+                close_df=sl_close_df,
+                symbol_mom=sl_mom,
+                symbol_above_ma=sl_above_ma,
+                capital=float(sl_capital),
+                max_positions=int(sl_top_sector),
+            )
+            st.caption("Suggested Orders (Local Paper)")
+            if sl_orders.empty:
+                st.info("No tradable symbols passed the MA filter.")
+            else:
+                st.dataframe(
+                    sl_orders.style.format(
+                        {
+                            "momentum": "{:+.2%}",
+                            "last_price": "${:,.2f}",
+                            "target_weight": "{:.1%}",
+                            "capital_used": "${:,.2f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    f"Capital used: ${float(sl_orders['capital_used'].sum()):,.2f} / ${float(sl_capital):,.2f}"
+                )
 
     st.subheader("Candlestick")
     kline_col1, kline_col2, kline_col3 = st.columns([1.4, 1.4, 1.2])
